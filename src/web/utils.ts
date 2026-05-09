@@ -29,6 +29,13 @@ import { FlashSectionMessage, PartitionInfo } from "./webserial";
 import { Transport, UsbJtagSerialReset } from "esptool-js";
 
 const USB_JTAG_SERIAL_PID = 0x1001;
+const FLASH_ARGS_FILE_NAME = "flasher_args.json";
+
+interface FlashFilesConfig {
+  flasherArgsUri: Uri;
+  filesBaseUri: Uri;
+  sourceDescription: string;
+}
 
 export const errorNotificationMessage =
   "Build file not found. Make sure to build your ESP-IDF project first and if 'idf.buildPath' is defined, that is correctly set.";
@@ -151,38 +158,7 @@ export async function getBuildDirectoryFileUri(
 ) {
   const buildDirectory = await getBuildDirectoryUri(workspaceFolder);
   const requestedPath = normalizePath(fileRelativeToBuildPath.join("/"));
-  const candidates: Uri[] = [];
-
-  if (isAbsolutePath(requestedPath) || isUriLike(requestedPath)) {
-    candidates.push(pathToWorkspaceUri(workspaceFolder, requestedPath));
-  } else {
-    const parts = splitPath(requestedPath);
-    candidates.push(Uri.joinPath(buildDirectory, ...parts));
-    candidates.push(Uri.joinPath(workspaceFolder, ...parts));
-  }
-
-  const tried: string[] = [];
-  const seen = new Set<string>();
-  for (const candidate of candidates) {
-    const key = candidate.toString();
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    tried.push(candidate.toString());
-    try {
-      const stat = await workspace.fs.stat(candidate);
-      if (stat.type === FileType.File) {
-        return candidate;
-      }
-    } catch (error) {
-      // Continue to alternative locations.
-    }
-  }
-
-  throw FileSystemError.FileNotFound(
-    `Build file not found: ${requestedPath}. Tried: ${tried.join(", ")}`
-  );
+  return getFileUriFromBase(workspaceFolder, buildDirectory, requestedPath);
 }
 
 export async function getMonitorBaudRate(workspaceFolder: Uri) {
@@ -196,16 +172,33 @@ export async function getMonitorBaudRate(workspaceFolder: Uri) {
   return monitorBaudRateNum;
 }
 
-export async function getFlashSectionsForCurrentWorkspace(workspaceFolder: Uri) {
-  const flasherArgsContentStr = await getBuildDirectoryFileContent(
-    workspaceFolder,
-    "flasher_args.json"
+export async function getFlashSectionsForCurrentWorkspace(
+  workspaceFolder: Uri,
+  outputChannel?: OutputChannel
+) {
+  const flashFilesConfig = await getFlashFilesConfig(workspaceFolder);
+  const flasherArgsContent = await workspace.fs.readFile(
+    flashFilesConfig.flasherArgsUri
   );
+  const flasherArgsContentStr = uInt8ArrayToString(flasherArgsContent);
   const flashFileJson = JSON.parse(flasherArgsContentStr);
+
+  outputChannel?.appendLine(`Flash files source: ${flashFilesConfig.sourceDescription}`);
+  outputChannel?.appendLine(`Flasher args file: ${flashFilesConfig.flasherArgsUri.toString()}`);
+  outputChannel?.appendLine(`Flash files base path: ${flashFilesConfig.filesBaseUri.toString()}`);
+
   const binPromises: Promise<PartitionInfo>[] = [];
   Object.keys(flashFileJson["flash_files"]).forEach((offset) => {
     const fileName = flashFileJson["flash_files"][offset] as string;
-    binPromises.push(readFileIntoBuffer(workspaceFolder, fileName, offset));
+    binPromises.push(
+      readFlashFileIntoBuffer(
+        workspaceFolder,
+        flashFilesConfig.filesBaseUri,
+        fileName,
+        offset,
+        outputChannel
+      )
+    );
   });
   const binaries = await Promise.all(binPromises);
   const message: FlashSectionMessage = {
@@ -234,6 +227,126 @@ export async function readFileIntoBuffer(
   return fileBufferResult;
 }
 
+async function getFlashFilesConfig(workspaceFolder: Uri): Promise<FlashFilesConfig> {
+  const configuration = workspace.getConfiguration("", workspaceFolder);
+  const useCustomFlashFiles = configuration.get(
+    "idfWeb.useCustomFlashFiles"
+  ) as boolean | undefined;
+
+  if (useCustomFlashFiles) {
+    const configuredPath = (
+      configuration.get("idfWeb.customFlashFilesPath") as string | undefined
+    )?.trim();
+
+    if (!configuredPath) {
+      throw FileSystemError.FileNotFound(
+        "idfWeb.useCustomFlashFiles is enabled, but idfWeb.customFlashFilesPath is empty."
+      );
+    }
+
+    const resolvedPath = resolveVariables(configuredPath, workspaceFolder);
+    const customUri = pathToWorkspaceUri(workspaceFolder, resolvedPath);
+    const customStat = await workspace.fs.stat(customUri);
+
+    if (customStat.type === FileType.Directory) {
+      const flasherArgsUri = await getFileUriFromBase(
+        workspaceFolder,
+        customUri,
+        FLASH_ARGS_FILE_NAME
+      );
+      return {
+        flasherArgsUri,
+        filesBaseUri: customUri,
+        sourceDescription: `custom path setting idfWeb.customFlashFilesPath=${configuredPath}`,
+      };
+    }
+
+    if (customStat.type === FileType.File) {
+      return {
+        flasherArgsUri: customUri,
+        filesBaseUri: getParentUri(customUri),
+        sourceDescription: `custom file setting idfWeb.customFlashFilesPath=${configuredPath}`,
+      };
+    }
+
+    throw FileSystemError.FileNotFound(
+      `Custom flash files path is not a file or directory: ${customUri.toString()}`
+    );
+  }
+
+  const buildDirectory = await getBuildDirectoryUri(workspaceFolder);
+  const flasherArgsUri = await getFileUriFromBase(
+    workspaceFolder,
+    buildDirectory,
+    FLASH_ARGS_FILE_NAME
+  );
+  return {
+    flasherArgsUri,
+    filesBaseUri: buildDirectory,
+    sourceDescription: "ESP-IDF build output",
+  };
+}
+
+async function readFlashFileIntoBuffer(
+  workspaceFolder: Uri,
+  filesBaseUri: Uri,
+  name: string,
+  offset: string,
+  outputChannel?: OutputChannel
+) {
+  const fileUri = await getFileUriFromBase(workspaceFolder, filesBaseUri, name);
+  outputChannel?.appendLine(
+    `Loading flash file offset ${offset}: ${name} -> ${fileUri.toString()}`
+  );
+  const fileBuffer = await workspace.fs.readFile(fileUri);
+  const fileBufferResult: PartitionInfo = {
+    data: uInt8ArrayToString(fileBuffer),
+    name,
+    address: parseInt(offset),
+  };
+  return fileBufferResult;
+}
+
+async function getFileUriFromBase(
+  workspaceFolder: Uri,
+  baseUri: Uri,
+  requestedPath: string
+) {
+  const normalizedRequestedPath = normalizePath(requestedPath);
+  const candidates: Uri[] = [];
+
+  if (isAbsolutePath(normalizedRequestedPath) || isUriLike(normalizedRequestedPath)) {
+    candidates.push(pathToWorkspaceUri(workspaceFolder, normalizedRequestedPath));
+  } else {
+    const parts = splitPath(normalizedRequestedPath);
+    candidates.push(Uri.joinPath(baseUri, ...parts));
+    candidates.push(Uri.joinPath(workspaceFolder, ...parts));
+  }
+
+  const tried: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const key = candidate.toString();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    tried.push(candidate.toString());
+    try {
+      const stat = await workspace.fs.stat(candidate);
+      if (stat.type === FileType.File) {
+        return candidate;
+      }
+    } catch (error) {
+      // Continue to alternative locations.
+    }
+  }
+
+  throw FileSystemError.FileNotFound(
+    `Build file not found: ${normalizedRequestedPath}. Tried: ${tried.join(", ")}`
+  );
+}
+
 export function resolveVariables(configPath: string, scope: Uri) {
   const regexp = /\$\{(.*?)\}/g; // Find ${anything}
   return configPath.replace(regexp, (match: string) => {
@@ -260,6 +373,12 @@ function pathToWorkspaceUri(workspaceFolder: Uri, pathOrUri: string) {
   }
 
   return Uri.joinPath(workspaceFolder, ...splitPath(normalized));
+}
+
+function getParentUri(uri: Uri) {
+  const parts = uri.path.split("/").filter((part) => part.length > 0);
+  const parentPath = `/${parts.slice(0, -1).join("/")}`;
+  return uri.with({ path: parentPath === "" ? "/" : parentPath });
 }
 
 function normalizePath(pathValue: string) {
