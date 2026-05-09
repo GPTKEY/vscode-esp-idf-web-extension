@@ -33,7 +33,11 @@ import {
   Transport,
 } from "esptool-js";
 import { enc, MD5 } from "crypto-js";
-import { getFlashSectionsForCurrentWorkspace, handleMonitorError, universalReset } from "./utils";
+import {
+  getFlashSectionsForCurrentWorkspace,
+  handleMonitorError,
+  universalReset,
+} from "./utils";
 import { IDFWebMonitorTerminal } from "./monitorTerminalManager";
 
 export const OUTPUT_CHANNEL_NAME = "ESP-IDF Web";
@@ -100,7 +104,8 @@ export async function flashTask(
   const esploader = new ESPLoader(loaderOptions);
   const chip = esploader.main();
   const flashSectionsMessage = await getFlashSectionsForCurrentWorkspace(
-    workspaceFolder
+    workspaceFolder,
+    outputChannel
   );
   const flashOptions: FlashOptions = {
     fileArray: flashSectionsMessage.sections,
