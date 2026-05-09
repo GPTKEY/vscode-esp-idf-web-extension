@@ -96,6 +96,18 @@
             "description": "Baud rate for flash command",
             "scope": "window"
           },
+          "idfWeb.useCustomFlashFiles": {
+            "type": "boolean",
+            "default": false,
+            "description": "Use the custom flash files path instead of the ESP-IDF build output path for flashing.",
+            "scope": "window"
+          },
+          "idfWeb.customFlashFilesPath": {
+            "type": "string",
+            "default": "",
+            "description": "Custom ESP-IDF flash files path. Use a directory containing flasher_args.json or a direct path to flasher_args.json. Supports ${workspaceFolder}. This setting is used only when idfWeb.useCustomFlashFiles is enabled.",
+            "scope": "window"
+          },
           "idfWeb.enableStatusBarIcons": {
             "type": "boolean",
             "default": true,
