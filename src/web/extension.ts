@@ -17,29 +17,29 @@
  */
 
 import * as vscode from "vscode";
-import {
-  flashAndMonitor,
-  flashWithWebSerial,
-  isFlashing,
-} from "./webserial";
-import { IDFWebSerialPort } from "./portManager";
-import { createStatusBarItem } from "./utils";
-import { IDFWebMonitorTerminal } from "./monitorTerminalManager";
-import { monitorWithWebserial } from "./monitor";
 
 const statusBarItems: { [key: string]: vscode.StatusBarItem } = {};
 
 export function activate(context: vscode.ExtensionContext) {
-  if ((navigator as any).serial === undefined && (navigator as any).usb) { 
+  if (
+    typeof navigator !== "undefined" &&
+    (navigator as any).serial === undefined &&
+    (navigator as any).usb
+  ) {
     console.log("WebSerial not supported. Polyfilling with WebUSB");
   }
+
   const flashDisposable = vscode.commands.registerCommand(
     "espIdfWeb.flash",
     async () => {
+      const { IDFWebMonitorTerminal } = await import("./monitorTerminalManager");
+      const { IDFWebSerialPort } = await import("./portManager");
+      const { flashWithWebSerial } = await import("./webserial");
+
       if (IDFWebMonitorTerminal.exists()) {
         await IDFWebMonitorTerminal.dispose();
       }
-      let workspaceFolder = await getWorkspaceFolder();
+      const workspaceFolder = await getWorkspaceFolder();
       if (!workspaceFolder) {
         return;
       }
@@ -55,10 +55,14 @@ export function activate(context: vscode.ExtensionContext) {
   const monitorDisposable = vscode.commands.registerCommand(
     "espIdfWeb.monitor",
     async () => {
+      const { IDFWebMonitorTerminal } = await import("./monitorTerminalManager");
+      const { IDFWebSerialPort } = await import("./portManager");
+      const { monitorWithWebserial } = await import("./monitor");
+
       if (IDFWebMonitorTerminal.exists()) {
         await IDFWebMonitorTerminal.dispose();
       }
-      let workspaceFolder = await getWorkspaceFolder();
+      const workspaceFolder = await getWorkspaceFolder();
       if (!workspaceFolder) {
         return;
       }
@@ -73,10 +77,14 @@ export function activate(context: vscode.ExtensionContext) {
   const flashMonitorDisposable = vscode.commands.registerCommand(
     "espIdfWeb.flashAndMonitor",
     async () => {
+      const { IDFWebMonitorTerminal } = await import("./monitorTerminalManager");
+      const { IDFWebSerialPort } = await import("./portManager");
+      const { flashAndMonitor } = await import("./webserial");
+
       if (IDFWebMonitorTerminal.exists()) {
         await IDFWebMonitorTerminal.dispose();
       }
-      let workspaceFolder = await getWorkspaceFolder();
+      const workspaceFolder = await getWorkspaceFolder();
       if (!workspaceFolder) {
         return;
       }
@@ -91,6 +99,7 @@ export function activate(context: vscode.ExtensionContext) {
   const selectPort = vscode.commands.registerCommand(
     "espIdfWeb.selectPort",
     async () => {
+      const { IDFWebSerialPort } = await import("./portManager");
       await IDFWebSerialPort.init();
     }
   );
@@ -99,6 +108,10 @@ export function activate(context: vscode.ExtensionContext) {
   const disposePort = vscode.commands.registerCommand(
     "espIdfWeb.disposePort",
     async () => {
+      const { IDFWebMonitorTerminal } = await import("./monitorTerminalManager");
+      const { IDFWebSerialPort } = await import("./portManager");
+      const { isFlashing } = await import("./webserial");
+
       if (IDFWebMonitorTerminal.exists()) {
         await IDFWebMonitorTerminal.dispose();
       }
@@ -128,15 +141,22 @@ export function activate(context: vscode.ExtensionContext) {
         if (enableStatusBarIcons) {
           statusBarItems["flash"].show();
           statusBarItems["monitor"].show();
-          if (IDFWebSerialPort.statusBarItem) {
-            IDFWebSerialPort.statusBarItem.show();
-          }
         } else {
           statusBarItems["flash"].hide();
           statusBarItems["monitor"].hide();
+        }
+
+        try {
+          const { IDFWebSerialPort } = await import("./portManager");
           if (IDFWebSerialPort.statusBarItem) {
-            IDFWebSerialPort.statusBarItem.hide();
+            if (enableStatusBarIcons) {
+              IDFWebSerialPort.statusBarItem.show();
+            } else {
+              IDFWebSerialPort.statusBarItem.hide();
+            }
           }
+        } catch (error) {
+          console.warn("Unable to update ESP-IDF Web serial port status bar item", error);
         }
       }
     })
@@ -144,7 +164,12 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export async function deactivate() {
-  await IDFWebSerialPort.disconnect();
+  try {
+    const { IDFWebSerialPort } = await import("./portManager");
+    await IDFWebSerialPort.disconnect();
+  } catch (error) {
+    console.warn("Unable to disconnect ESP-IDF Web serial port during deactivation", error);
+  }
 }
 
 function createStatusBarItems() {
@@ -160,6 +185,28 @@ function createStatusBarItems() {
     "espIdfWeb.monitor",
     93
   );
+}
+
+function createStatusBarItem(
+  icon: string,
+  tooltip: string,
+  cmd: string,
+  priority: number
+) {
+  const statusBarItem = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Left,
+    priority
+  );
+  statusBarItem.text = icon;
+  statusBarItem.tooltip = tooltip;
+  statusBarItem.command = cmd;
+  const enableStatusBarIcons = vscode.workspace
+    .getConfiguration("")
+    .get("idfWeb.enableStatusBarIcons") as boolean;
+  if (enableStatusBarIcons) {
+    statusBarItem.show();
+  }
+  return statusBarItem;
 }
 
 async function getWorkspaceFolder() {
