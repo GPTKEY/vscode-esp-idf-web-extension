@@ -1,0 +1,48 @@
+name: Build VSIX
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - bugfix
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-vsix:
+    name: Build installable VSIX
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: yarn
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Package extension
+        run: yarn run package
+
+      - name: Verify VSIX package
+        run: |
+          test -f esp-idf-web-extension.vsix
+          ls -lh esp-idf-web-extension.vsix
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-idf-web-extension-vsix
+          path: esp-idf-web-extension.vsix
+          if-no-files-found: error
+          retention-days: 30
