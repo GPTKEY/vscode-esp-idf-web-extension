@@ -16,7 +16,15 @@
  * limitations under the License.
  */
 
-import { FileType, StatusBarAlignment, Uri, window, workspace, FileSystemError, OutputChannel } from "vscode";
+import {
+  FileSystemError,
+  FileType,
+  OutputChannel,
+  StatusBarAlignment,
+  Uri,
+  window,
+  workspace,
+} from "vscode";
 import { FlashSectionMessage, PartitionInfo } from "./webserial";
 import { Transport, UsbJtagSerialReset } from "esptool-js";
 
@@ -62,7 +70,7 @@ export async function universalReset(transport: Transport) {
 }
 
 export async function handleMonitorError(outputChnl: OutputChannel, error: any) {
-  const rawMessage = (error as Error).message.replace("Error setting up device: ", "");
+  const rawMessage = ((error as Error).message || String(error)).replace("Error setting up device: ", "");
   const errorType = rawMessage.split(":")[0];
   const errorMessage = rawMessage.replace(`${errorType}: `, "");
   outputChnl.show();
@@ -70,6 +78,7 @@ export async function handleMonitorError(outputChnl: OutputChannel, error: any) 
   if (error instanceof FileSystemError && error.code === "FileNotFound") {
     window.showErrorMessage(errorNotificationMessage);
     outputChnl.appendLine(errorNotificationMessage);
+    outputChnl.appendLine(rawMessage);
     return;
   } else if (errorMessage === webUsbPolyfillClaimError) {
     if ((navigator as any).serial) {
@@ -86,34 +95,94 @@ export async function getBuildDirectoryFileContent(
   workspaceFolder: Uri,
   ...fileRelativeToBuildPath: string[]
 ) {
-  let resultFilePath: Uri;
-  let buildPath = workspace
-    .getConfiguration("", workspaceFolder)
-    .get("idf.buildPath") as string;
-  if (buildPath) {
-    buildPath = resolveVariables(buildPath, workspaceFolder);
-    const buildPathUri = Uri.parse(buildPath).with({
-      scheme: workspaceFolder.scheme,
-      authority: workspaceFolder.authority,
-    });
-    const buildPathStat = await workspace.fs.stat(buildPathUri);
-    if (buildPathStat.type !== FileType.Directory) {
-      throw new Error(`${buildPath} is not a directory or does not exists.`);
-    }
-    resultFilePath = Uri.joinPath(buildPathUri, ...fileRelativeToBuildPath);
-  } else {
-    resultFilePath = Uri.joinPath(
-      workspaceFolder,
-      "build",
-      ...fileRelativeToBuildPath
-    );
-  }
-  const projDescStat = await workspace.fs.stat(resultFilePath);
-  if (projDescStat.type !== FileType.File) {
-    throw new Error(`${resultFilePath} does not exists.`);
-  }
+  const resultFilePath = await getBuildDirectoryFileUri(
+    workspaceFolder,
+    ...fileRelativeToBuildPath
+  );
   const resultFileContent = await workspace.fs.readFile(resultFilePath);
   return uInt8ArrayToString(resultFileContent);
+}
+
+export async function getBuildDirectoryUri(workspaceFolder: Uri) {
+  const candidates: Uri[] = [];
+  const configuredBuildPath = workspace
+    .getConfiguration("", workspaceFolder)
+    .get("idf.buildPath") as string | undefined;
+
+  if (configuredBuildPath && configuredBuildPath.trim().length > 0) {
+    const resolvedBuildPath = resolveVariables(
+      configuredBuildPath.trim(),
+      workspaceFolder
+    );
+    candidates.push(pathToWorkspaceUri(workspaceFolder, resolvedBuildPath));
+  }
+
+  candidates.push(Uri.joinPath(workspaceFolder, "build"));
+
+  const tried: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const key = candidate.toString();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    tried.push(candidate.toString());
+    try {
+      const stat = await workspace.fs.stat(candidate);
+      if (stat.type === FileType.Directory) {
+        return candidate;
+      }
+    } catch (error) {
+      // Try the next candidate. A relative idf.buildPath such as "build" used to
+      // be resolved as /build in Codespaces; falling back to workspace/build keeps
+      // the flash command usable even when the setting is old or incomplete.
+    }
+  }
+
+  throw FileSystemError.FileNotFound(
+    `ESP-IDF build directory not found. Tried: ${tried.join(", ")}`
+  );
+}
+
+export async function getBuildDirectoryFileUri(
+  workspaceFolder: Uri,
+  ...fileRelativeToBuildPath: string[]
+) {
+  const buildDirectory = await getBuildDirectoryUri(workspaceFolder);
+  const requestedPath = normalizePath(fileRelativeToBuildPath.join("/"));
+  const candidates: Uri[] = [];
+
+  if (isAbsolutePath(requestedPath) || isUriLike(requestedPath)) {
+    candidates.push(pathToWorkspaceUri(workspaceFolder, requestedPath));
+  } else {
+    const parts = splitPath(requestedPath);
+    candidates.push(Uri.joinPath(buildDirectory, ...parts));
+    candidates.push(Uri.joinPath(workspaceFolder, ...parts));
+  }
+
+  const tried: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const key = candidate.toString();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    tried.push(candidate.toString());
+    try {
+      const stat = await workspace.fs.stat(candidate);
+      if (stat.type === FileType.File) {
+        return candidate;
+      }
+    } catch (error) {
+      // Continue to alternative locations.
+    }
+  }
+
+  throw FileSystemError.FileNotFound(
+    `Build file not found: ${requestedPath}. Tried: ${tried.join(", ")}`
+  );
 }
 
 export async function getMonitorBaudRate(workspaceFolder: Uri) {
@@ -168,11 +237,53 @@ export async function readFileIntoBuffer(
 export function resolveVariables(configPath: string, scope: Uri) {
   const regexp = /\$\{(.*?)\}/g; // Find ${anything}
   return configPath.replace(regexp, (match: string) => {
-    if (scope && match.indexOf("workspaceFolder") > 0) {
+    if (match.includes("workspaceFolder")) {
       return scope.fsPath === "/" || scope.fsPath === "\\" ? "" : scope.fsPath;
     }
     return match;
   });
+}
+
+function pathToWorkspaceUri(workspaceFolder: Uri, pathOrUri: string) {
+  const normalized = normalizePath(pathOrUri);
+
+  if (isUriLike(normalized) && !isWindowsAbsolutePath(normalized)) {
+    const parsed = Uri.parse(normalized);
+    return parsed.with({
+      scheme: workspaceFolder.scheme,
+      authority: workspaceFolder.authority,
+    });
+  }
+
+  if (isAbsolutePath(normalized)) {
+    return workspaceFolder.with({ path: normalized });
+  }
+
+  return Uri.joinPath(workspaceFolder, ...splitPath(normalized));
+}
+
+function normalizePath(pathValue: string) {
+  const normalized = pathValue.replace(/\\/g, "/");
+  if (isUriLike(normalized) && !isWindowsAbsolutePath(normalized)) {
+    return normalized;
+  }
+  return normalized.replace(/\/+/g, "/");
+}
+
+function splitPath(pathValue: string) {
+  return normalizePath(pathValue).split("/").filter((part) => part.length > 0 && part !== ".");
+}
+
+function isUriLike(pathValue: string) {
+  return /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(pathValue);
+}
+
+function isAbsolutePath(pathValue: string) {
+  return pathValue.startsWith("/") || isWindowsAbsolutePath(pathValue);
+}
+
+function isWindowsAbsolutePath(pathValue: string) {
+  return /^[a-zA-Z]:\//.test(pathValue);
 }
 
 export function createStatusBarItem(
